@@ -28,10 +28,13 @@ export const registerScanningCommands = (
     run: ({ args, options }) =>
       withCommandCancellation(() =>
         logCliCommand(logger, CLI_COMMANDS.scanYara, async () => {
-          const result = await scanYara({
-            targetPath: resolve(args.path),
-            rulesPath: options.rules ? resolve(options.rules) : undefined,
-          });
+          const request = options.rules
+            ? {
+                targetPath: resolve(args.path),
+                rulesPath: resolve(options.rules),
+              }
+            : { targetPath: resolve(args.path) };
+          const result = await scanYara(request);
           if (!result.ok) {
             return {
               error: "YARA scan failed",
