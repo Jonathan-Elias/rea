@@ -47,6 +47,10 @@ const environmentSchema = z.object({
   REA_HOPPER_STARTUP_TIMEOUT_MS: providerStartupTimeoutSchema.default(
     DEFAULT_HOPPER_STARTUP_TIMEOUT_MS,
   ),
+  REA_MIPS_ALLOW_EXTENDED_ISA: z
+    .enum(["0", "1"])
+    .default("0")
+    .transform((v) => v === "1"),
   REA_GHIDRA_LANGUAGE_ID: ghidraLanguageIdSchema.optional(),
   REA_GHIDRA_COMPILER_SPEC_ID: ghidraCompilerSpecIdSchema.optional(),
   REA_GHIDRA_DISABLED_ANALYZERS: ghidraDisabledAnalyzersSchema.optional(),

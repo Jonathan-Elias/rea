@@ -8,6 +8,28 @@ const MIPS_ET_EXEC = 2;
 const MIPS_ET_DYN = 3;
 const MIPS16_HEADER_ASE = 0x04000000;
 
+const MIPS_ARCH_NAMES: Record<number, string> = {
+  0x00000000: "mips1",
+  0x10000000: "mips2",
+  0x20000000: "mips3",
+  0x30000000: "mips4",
+  0x40000000: "mips5",
+  0x50000000: "mips32",
+  0x60000000: "mips64",
+  0x70000000: "mips32r2",
+  0x80000000: "mips64r2",
+};
+
+const EXTENDED_ISA_ARCHS = new Set([
+  0x00000000, // EF_MIPS_ARCH_1
+  0x10000000, // EF_MIPS_ARCH_2
+  0x20000000, // EF_MIPS_ARCH_3
+  0x30000000, // EF_MIPS_ARCH_4
+  0x40000000, // EF_MIPS_ARCH_5
+  0x50000000, // EF_MIPS_ARCH_32
+  0x70000000, // EF_MIPS_ARCH_32R2
+]);
+
 /** A distinct compressed shared-image shape; admission still checks every declaration. */
 const isGhidraMips16SharedTarget = (target: BinaryTarget): boolean =>
   target.kind === "executable" &&
@@ -15,18 +37,34 @@ const isGhidraMips16SharedTarget = (target: BinaryTarget): boolean =>
   target.mips.type === MIPS_ET_DYN &&
   (target.mips.flags & 0x0f000000) === MIPS16_HEADER_ASE;
 
-/** Derive the verified MIPS32 import pin from this target's observed byte order. */
+/** Derive the verified MIPS import pin from this target's observed byte order and class. */
 export const ghidraMipsLanguageOverride = (
   target: BinaryTarget,
-): GhidraLanguageOverride | undefined =>
-  (isGhidraMips16SharedTarget(target) || hasLegacyMipsHeaderShape(target)) &&
-  ghidraMipsUnsupportedReason(target) === null &&
-  target.architecture === "mips"
-    ? {
-        languageId: `MIPS:${target.mips.byteOrder === "little" ? "LE" : "BE"}:32:default`,
-        compilerSpecId: "default",
-      }
-    : undefined;
+): GhidraLanguageOverride | undefined => {
+  if (
+    target.architecture !== "mips" ||
+    ghidraMipsUnsupportedReason(target) !== null
+  )
+    return undefined;
+  const endian = target.mips.byteOrder === "little" ? "LE" : "BE";
+  const bits = target.mips.elfClass === 64 ? 64 : 32;
+  if (isGhidraMips16SharedTarget(target) || hasLegacyMipsHeaderShape(target))
+    return {
+      languageId: `MIPS:${endian}:${bits}:default`,
+      compilerSpecId: "default",
+    };
+  const arch = target.mips.flags & 0xf0000000;
+  if (
+    EXTENDED_ISA_ARCHS.has(arch) &&
+    arch !== 0x70000000 &&
+    arch !== 0x50000000
+  )
+    return {
+      languageId: `MIPS:${endian}:${bits}:default`,
+      compilerSpecId: "default",
+    };
+  return undefined;
+};
 
 /**
  * Recordless legacy ELF32 MIPS admission: the header declares no ABI field and
@@ -50,7 +88,7 @@ const hasLegacyMipsHeaderShape = (target: BinaryTarget): boolean => {
     // recordless relocatable objects stay outside the inferred-o32 assumption.
     target.mips.elfClass === 32 &&
     target.mips.type === MIPS_ET_EXEC &&
-    (arch === 0x50000000 || arch === 0x70000000) &&
+    EXTENDED_ISA_ARCHS.has(arch) &&
     (flags & 0x0000f000) === 0 &&
     (flags & 0x20) === 0 &&
     // EF_MIPS_ABI_ON32 (bit 0x40) declares the old n32 ABI; it is not an
@@ -65,6 +103,14 @@ const hasLegacyMipsHeaderShape = (target: BinaryTarget): boolean => {
   );
 };
 
+/** Whether the caller opted into extended MIPS ISA revisions beyond mips32r2. */
+let extendedIsaAllowed: boolean | undefined;
+export const mipsExtendedIsaAllowed = (): boolean => {
+  if (extendedIsaAllowed === undefined)
+    extendedIsaAllowed = process.env.REA_MIPS_ALLOW_EXTENDED_ISA === "1";
+  return extendedIsaAllowed;
+};
+
 /** Keep family recognition separate from the deliberately bounded Ghidra lane. */
 export const ghidraMipsUnsupportedReason = (
   target: BinaryTarget,
@@ -75,21 +121,26 @@ export const ghidraMipsUnsupportedReason = (
   if (target.format !== "elf" || metadata === undefined)
     return "MIPS analysis requires ELF header metadata; a family name alone does not select an ISA or ABI.";
   const shared = isGhidraMips16SharedTarget(target);
-  if (metadata.elfClass !== 32)
-    return "This Ghidra MIPS lane supports ELF32 only; MIPS64 and n64 remain unsupported.";
+  if (metadata.elfClass !== 32 && metadata.elfClass !== 64)
+    return "MIPS analysis requires ELF32 or ELF64.";
+  if (metadata.elfClass === 64 && !mipsExtendedIsaAllowed())
+    return "MIPS64 ELF64 targets require REA_MIPS_ALLOW_EXTENDED_ISA=1; Ghidra supports them but the lane is not yet verified.";
   if (
     metadata.type !== MIPS_ET_EXEC &&
     metadata.type !== MIPS_ET_REL &&
+    metadata.type !== MIPS_ET_DYN &&
     !shared
   )
-    return "This Ghidra MIPS lane supports ET_EXEC and ET_REL only; shared images and PSP PRX need separate load verification.";
+    return "This Ghidra MIPS lane supports ET_EXEC, ET_DYN and ET_REL; other ELF types need separate load verification.";
   if ((metadata.flags & 0x0f000000) !== 0 && !shared)
     return "MIPS16, microMIPS and other ASE encodings are outside this standard-instruction MIPS lane.";
   if ((metadata.flags & 0x00ff0000) !== 0)
     return "Machine-specific MIPS variants, including PSP Allegrex, need a separately supported processor profile.";
   const arch = metadata.flags & 0xf0000000;
-  if (arch !== 0x70000000 && arch !== 0x50000000)
-    return "This Ghidra MIPS lane requires EF_MIPS_ARCH_32R2 or a recordless legacy EF_MIPS_ARCH_32 header; other ISA revisions need separate verification.";
+  if (!EXTENDED_ISA_ARCHS.has(arch)) {
+    if (mipsExtendedIsaAllowed()) return null; // Allow any arch when override is set
+    return `This Ghidra MIPS lane requires mips1–mips5, mips32 or mips32r2 (got ${MIPS_ARCH_NAMES[arch] ?? `0x${arch.toString(16)}`}). Set REA_MIPS_ALLOW_EXTENDED_ISA=1 to bypass.`;
+  }
   const recordlessShape =
     (metadata.flags & 0x0000f000) === 0 &&
     (metadata.flags & 0x20) === 0 &&
@@ -120,8 +171,8 @@ export const ghidraMipsUnsupportedReason = (
     (metadata.flags & 0x20) !== 0
   )
     return "This Ghidra MIPS lane requires an explicit o32 ABI or a recordless legacy header with an unspecified ABI; n32, EABI and mixed declarations remain unsupported.";
-  if (arch !== 0x70000000)
-    return "This Ghidra MIPS lane requires EF_MIPS_ARCH_32R2 for headers that declare an ABI; EF_MIPS_ARCH_32 headers are admitted only through the recordless legacy admission.";
+  if (arch !== 0x70000000 && !EXTENDED_ISA_ARCHS.has(arch))
+    return `This Ghidra MIPS lane requires a recognized ISA revision for headers that declare an ABI (got ${MIPS_ARCH_NAMES[arch] ?? `0x${arch.toString(16)}`}). Set REA_MIPS_ALLOW_EXTENDED_ISA=1 to bypass.`;
   if ((metadata.flags & 0x00000200) !== 0)
     return "EF_MIPS_FP64 requires separate verification of 64-bit floating-point register semantics in this Ghidra lane.";
   if ((metadata.flags & 0x00000400) !== 0)
@@ -147,8 +198,10 @@ export const ghidraMipsUnsupportedReason = (
     ].join(" ");
   if (abi.version !== 0)
     return "This Ghidra MIPS lane requires ABI flags version 0; newer record semantics are unsupported.";
-  if (abi.isaLevel !== 32 || abi.isaRevision !== 2)
+  if (arch === 0x70000000 && (abi.isaLevel !== 32 || abi.isaRevision !== 2))
     return "MIPS ABI flags must agree with the declared MIPS32r2 ISA.";
+  if (arch !== 0x70000000 && abi.isaLevel === 0)
+    return "MIPS ABI flags declare an unknown ISA level.";
   if (abi.gprSize !== 1 || abi.cpr2Size !== 0)
     return "This Ghidra MIPS lane requires 32-bit GPRs and no CPR2; other register modes need separate verification.";
   const hardFloat = abi.cpr1Size === 1 && (abi.fpAbi === 1 || abi.fpAbi === 5);
@@ -163,6 +216,28 @@ export const ghidraMipsUnsupportedReason = (
   if ((abi.flags1 & ~1) !== 0 || abi.flags2 !== 0)
     return "MIPS ABI flags contain unsupported general flags.";
   return null;
+};
+
+/** Limitations emitted when a non-standard MIPS ISA revision is admitted. */
+export const ghidraMipsExtendedIsaLimitations = (
+  target: BinaryTarget,
+): readonly string[] => {
+  if (target.kind !== "executable" || target.architecture !== "mips") return [];
+  const arch =
+    target.mips?.flags !== undefined
+      ? target.mips.flags & 0xf0000000
+      : undefined;
+  if (arch === undefined || arch === 0x70000000 || arch === 0x50000000)
+    return [];
+  const name = MIPS_ARCH_NAMES[arch] ?? `0x${arch.toString(16)}`;
+  return [
+    `Extended MIPS ISA admitted: ${name}. The verified lane covers mips32/mips32r2 only; instruction semantics for other ISA revisions use Ghidra's default analysis without separate verification.`,
+    ...(target.mips.elfClass === 64
+      ? [
+          "MIPS64 ELF64 analysis uses Ghidra's 64-bit MIPS language. n64 and n32 ABI semantics are not separately verified.",
+        ]
+      : []),
+  ];
 };
 
 /** A legacy lane is established only after every MIPS declaration is admitted. */
@@ -259,8 +334,12 @@ export const ghidraMipsProfileParameters = (
   // exists because header auto-selection misselects a 64-bit language.
   const legacy = isLegacyMipsAdmission(target);
   const language = ghidraMipsLanguageOverride(target);
+  const arch = target.mips.flags & 0xf0000000;
+  const extendedIsa =
+    EXTENDED_ISA_ARCHS.has(arch) && arch !== 0x70000000 && arch !== 0x50000000;
+  const needsPin = legacy || extendedIsa;
   const pinnedLanguage =
-    legacy && languageOverride === undefined && language !== undefined
+    needsPin && languageOverride === undefined && language !== undefined
       ? {
           language_id: language.languageId,
           compiler_spec_id: language.compilerSpecId ?? "default",
@@ -318,12 +397,17 @@ export const ghidraMipsProfileParameters = (
     instruction_context_evidence: "per-address-isa-mode-v1",
     mips_support_lane: legacy
       ? "elf32-exec-arch32-legacy-pinned-v1"
-      : isGhidraMips16SharedTarget(target)
-        ? "elf32-dyn-o32-arch32r2-mips16-local-rel32-v1"
-        : target.mips.type === MIPS_ET_REL
-          ? "elf32-rel-o32-arch32r2-standard-v1"
-          : "elf32-exec-o32-arch32r2-standard-v3",
+      : extendedIsa
+        ? `elf${target.mips.elfClass}-exec-${MIPS_ARCH_NAMES[arch] ?? "unknown"}-extended-v1`
+        : isGhidraMips16SharedTarget(target)
+          ? "elf32-dyn-o32-arch32r2-mips16-local-rel32-v1"
+          : target.mips.type === MIPS_ET_REL
+            ? "elf32-rel-o32-arch32r2-standard-v1"
+            : "elf32-exec-o32-arch32r2-standard-v3",
     ...(legacy ? { mips_abi_basis: "inferred-o32-assumption-v1" } : {}),
+    ...(extendedIsa
+      ? { mips_extended_isa: MIPS_ARCH_NAMES[arch] ?? `0x${arch.toString(16)}` }
+      : {}),
     ...pinnedLanguage,
   };
 };

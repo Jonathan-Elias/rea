@@ -360,6 +360,7 @@ const elfArchitecture = (
     case 62:
       return "x86_64";
     case 8: // EM_MIPS: ISA, ABI and byte order remain separate ELF facts.
+    case 10: // EM_MIPS_RS3_LE: MIPS RS3000 Little-endian, used by some firmware.
       return "mips";
     case 40:
       return "arm";
